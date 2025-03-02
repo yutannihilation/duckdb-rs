@@ -51,10 +51,10 @@ use std::ffi::{c_void, CString};
 use libduckdb_sys::{
     self as ffi, duckdb_add_aggregate_function_to_set, duckdb_aggregate_function,
     duckdb_aggregate_function_add_parameter, duckdb_aggregate_function_set, duckdb_aggregate_function_set_extra_info,
-    duckdb_aggregate_function_set_function, duckdb_aggregate_function_set_name,
-    duckdb_aggregate_function_set_return_type, duckdb_connection, duckdb_create_aggregate_function,
-    duckdb_create_aggregate_function_set, duckdb_data_chunk, duckdb_delete_callback_t,
-    duckdb_destroy_aggregate_function, duckdb_function_info, duckdb_vector, DuckDBSuccess,
+    duckdb_aggregate_function_set_functions, duckdb_aggregate_function_set_name,
+    duckdb_aggregate_function_set_return_type, duckdb_aggregate_state, duckdb_connection,
+    duckdb_create_aggregate_function, duckdb_create_aggregate_function_set, duckdb_data_chunk,
+    duckdb_delete_callback_t, duckdb_destroy_aggregate_function, duckdb_function_info, duckdb_vector, DuckDBSuccess,
 };
 
 use crate::{core::LogicalTypeHandle, Error};
@@ -98,10 +98,35 @@ impl AggregateFunction {
     ///  * `function`: The function
     pub fn set_function(
         &self,
-        func: Option<unsafe extern "C" fn(info: duckdb_function_info, input: duckdb_data_chunk, output: duckdb_vector)>,
+        state_size: Option<unsafe extern "C" fn(info: duckdb_function_info) -> u64>,
+        state_init: Option<unsafe extern "C" fn(info: duckdb_function_info, state: duckdb_aggregate_state)>,
+        update: Option<
+            unsafe extern "C" fn(
+                info: duckdb_function_info,
+                input: duckdb_data_chunk,
+                states: *mut duckdb_aggregate_state,
+            ),
+        >,
+        combine: Option<
+            unsafe extern "C" fn(
+                info: duckdb_function_info,
+                source: *mut duckdb_aggregate_state,
+                target: *mut duckdb_aggregate_state,
+                count: u64,
+            ),
+        >,
+        finalize: Option<
+            unsafe extern "C" fn(
+                info: duckdb_function_info,
+                source: *mut duckdb_aggregate_state,
+                result: duckdb_vector,
+                count: u64,
+                offset: u64,
+            ),
+        >,
     ) -> &Self {
         unsafe {
-            duckdb_aggregate_function_set_function(self.ptr, func);
+            duckdb_aggregate_function_set_functions(self.ptr, state_size, state_init, update, combine, finalize);
         }
         self
     }

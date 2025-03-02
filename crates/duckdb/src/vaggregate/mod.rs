@@ -26,13 +26,14 @@ pub trait VAggregate: Sized {
     /// State that persists across invocations of the aggregate function (the lifetime of the connection)
     /// The state can be accessed by multiple threads, so it must be `Send + Sync`.
     type State: Default + Sized + Send + Sync;
+
     /// The actual function
     ///
     /// # Safety
     ///
     /// This function is unsafe because it:
     ///
-    /// - Dereferences multiple raw pointers (`func``).
+    /// - Dereferences multiple raw pointers (`func`).
     ///
     unsafe fn invoke(
         state: &Self::State,
@@ -126,7 +127,7 @@ impl Connection {
         for signature in S::signatures() {
             let aggregate_function = AggregateFunction::new(name)?;
             signature.register_with_aggregate(&aggregate_function);
-            aggregate_function.set_function(Some(aggregate_func::<S>));
+            aggregate_function.set_function(Some(aggregate_func::<S>), None, None, None, None); // TODO
             aggregate_function.set_extra_info::<S::State>();
             set.add_function(aggregate_function)?;
         }
