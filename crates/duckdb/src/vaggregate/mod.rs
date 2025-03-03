@@ -2,8 +2,8 @@ use std::ffi::CString;
 
 use function::{AggregateFunction, AggregateFunctionSet};
 use libduckdb_sys::{
-    duckdb_aggregate_function_get_extra_info, duckdb_aggregate_function_set_error, duckdb_data_chunk,
-    duckdb_function_info, duckdb_vector,
+    duckdb_aggregate_function_get_extra_info, duckdb_aggregate_function_set_error, duckdb_aggregate_state,
+    duckdb_data_chunk, duckdb_function_info, duckdb_vector,
 };
 
 use crate::{
@@ -27,18 +27,32 @@ pub trait VAggregate: Sized {
     /// The state can be accessed by multiple threads, so it must be `Send + Sync`.
     type State: Default + Sized + Send + Sync;
 
-    /// The actual function
-    ///
-    /// # Safety
-    ///
-    /// This function is unsafe because it:
-    ///
-    /// - Dereferences multiple raw pointers (`func`).
-    ///
-    unsafe fn invoke(
-        state: &Self::State,
+    fn state_size() -> u64 {
+        std::mem::size_of::<Self::State>() as u64
+    }
+
+    unsafe fn state_init(&mut self, state: &mut Self::State) -> Result<(), Box<dyn std::error::Error>>;
+
+    unsafe fn update(
+        &mut self,
+        state: &mut Self::State,
         input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
+        states: &mut [Self::State],
+    ) -> Result<(), Box<dyn std::error::Error>>;
+
+    unsafe fn combine(
+        &mut self,
+        source: &mut Self::State,
+        target: &mut Self::State,
+        count: u64,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+
+    unsafe fn finalize(
+        &mut self,
+        source: &mut [Self::State],
+        result: &mut dyn WritableVector,
+        count: u64,
+        offset: u64,
     ) -> Result<(), Box<dyn std::error::Error>>;
 
     /// The possible signatures of the aggregate function.
@@ -101,19 +115,93 @@ impl AggregateFunctionInfo {
         &*(duckdb_aggregate_function_get_extra_info(self.0).cast())
     }
 
+    pub unsafe fn get_aggregate_extra_info_mut<T>(&self) -> &mut T {
+        &mut *(duckdb_aggregate_function_get_extra_info(self.0).cast())
+    }
+
     pub unsafe fn set_error(&self, error: &str) {
         let c_str = CString::new(error).unwrap();
         duckdb_aggregate_function_set_error(self.0, c_str.as_ptr());
     }
 }
 
-unsafe extern "C" fn aggregate_func<T>(info: duckdb_function_info, input: duckdb_data_chunk, mut output: duckdb_vector)
+unsafe extern "C" fn aggregate_state_size<T>(_info: duckdb_function_info) -> u64
+where
+    T: VAggregate,
+{
+    T::state_size()
+}
+
+unsafe extern "C" fn aggregate_state_init<T>(info: duckdb_function_info, state: duckdb_aggregate_state)
 where
     T: VAggregate,
 {
     let info = AggregateFunctionInfo::from(info);
-    let mut input = DataChunkHandle::new_unowned(input);
-    let result = T::invoke(info.get_aggregate_extra_info(), &mut input, &mut output);
+    let aggregater: &mut T = info.get_aggregate_extra_info_mut();
+    let state: &mut T::State = &mut *((*state).internal_ptr.cast());
+    let result = aggregater.state_init(state);
+    if let Err(e) = result {
+        info.set_error(&e.to_string());
+    }
+}
+
+// unsafe extern "C" fn aggregate_update<T>(
+//     info: duckdb_function_info,
+//     input: duckdb_data_chunk,
+//     states: *mut duckdb_aggregate_state,
+// ) where
+//     T: VAggregate,
+// {
+//     let info = AggregateFunctionInfo::from(info);
+//     let mut input = DataChunkHandle::new_unowned(input);
+//     let row_count = input.len();
+//     let aggregater: &mut T = info.get_aggregate_extra_info_mut();
+
+//     let states_ptr: *mut T::State = (*states).internal_ptr.cast();
+//     let states: &mut [T::State] = std::slice::from_raw_parts_mut(states_ptr, row_count);
+
+//     let result = aggregater.update(state, &mut input);
+//     if let Err(e) = result {
+//         info.set_error(&e.to_string());
+//     }
+// }
+
+unsafe extern "C" fn aggregate_combine<T>(
+    info: duckdb_function_info,
+    source: *mut duckdb_aggregate_state,
+    target: *mut duckdb_aggregate_state,
+    count: u64,
+) where
+    T: VAggregate,
+{
+    let info = AggregateFunctionInfo::from(info);
+    let aggregater: &mut T = info.get_aggregate_extra_info_mut();
+
+    let source: &mut T::State = &mut *((*source).internal_ptr.cast());
+    let target: &mut T::State = &mut *((*target).internal_ptr.cast());
+
+    let result = aggregater.combine(source, target, count);
+    if let Err(e) = result {
+        info.set_error(&e.to_string());
+    }
+}
+
+unsafe extern "C" fn aggregate_finalize<T>(
+    info: duckdb_function_info,
+    source: *mut duckdb_aggregate_state,
+    mut result: duckdb_vector,
+    count: u64,
+    offset: u64,
+) where
+    T: VAggregate,
+{
+    let info = AggregateFunctionInfo::from(info);
+    let aggregater: &mut T = info.get_aggregate_extra_info_mut();
+
+    let source: &mut T::State = &mut *((*source).internal_ptr.cast());
+    let target: &mut T::State = &mut *((*target).internal_ptr.cast());
+
+    let result = aggregater.finalize(source, re);
     if let Err(e) = result {
         info.set_error(&e.to_string());
     }
@@ -127,7 +215,13 @@ impl Connection {
         for signature in S::signatures() {
             let aggregate_function = AggregateFunction::new(name)?;
             signature.register_with_aggregate(&aggregate_function);
-            aggregate_function.set_function(Some(aggregate_func::<S>), None, None, None, None); // TODO
+            aggregate_function.set_function(
+                Some(aggregate_state_size::<S>),
+                Some(aggregate_state_init::<S>),
+                None,
+                None,
+                None,
+            ); // TODO
             aggregate_function.set_extra_info::<S::State>();
             set.add_function(aggregate_function)?;
         }
@@ -158,19 +252,47 @@ mod test {
 
     use super::{AggregateFunctionSignature, VAggregate};
 
-    struct ErrorAggregate {}
+    #[derive(Debug, Default)]
+    struct WeightedSumState {
+        sum: i64,
+        count: u64,
+    }
 
-    impl VAggregate for ErrorAggregate {
-        type State = ();
+    struct WeightedSumAggregater {}
 
-        unsafe fn invoke(
-            _: &Self::State,
+    impl VAggregate for WeightedSumAggregater {
+        type State = WeightedSumState;
+
+        unsafe fn state_init(&mut self, state: &mut Self::State) -> Result<(), Box<dyn std::error::Error>> {
+            todo!()
+        }
+
+        unsafe fn update(
+            &mut self,
+            state: &mut Self::State,
             input: &mut DataChunkHandle,
-            _: &mut dyn WritableVector,
+            states: &mut [Self::State],
         ) -> Result<(), Box<dyn std::error::Error>> {
-            let mut msg = input.flat_vector(0).as_slice_with_len::<duckdb_string_t>(input.len())[0];
-            let string = DuckString::new(&mut msg).as_str();
-            Err(format!("Error: {}", string).into())
+            todo!()
+        }
+
+        unsafe fn combine(
+            &mut self,
+            source: &mut Self::State,
+            target: &mut Self::State,
+            count: u64,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            todo!()
+        }
+
+        unsafe fn finalize(
+            &mut self,
+            source: &mut [Self::State],
+            output: &mut dyn WritableVector,
+            count: u64,
+            offset: u64,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            todo!()
         }
 
         fn signatures() -> Vec<AggregateFunctionSignature> {
@@ -181,92 +303,53 @@ mod test {
         }
     }
 
-    #[derive(Debug)]
-    struct TestState {
-        #[allow(dead_code)]
-        inner: i32,
-    }
+    // #[derive(Debug)]
+    // struct TestState {
+    //     #[allow(dead_code)]
+    //     inner: i32,
+    // }
 
-    impl Default for TestState {
-        fn default() -> Self {
-            TestState { inner: 42 }
-        }
-    }
+    // impl Default for TestState {
+    //     fn default() -> Self {
+    //         TestState { inner: 42 }
+    //     }
+    // }
 
-    struct EchoAggregate {}
+    // struct EchoAggregate {}
 
-    impl VAggregate for EchoAggregate {
-        type State = TestState;
+    // impl VAggregate for EchoAggregate {
+    //     type State = TestState;
 
-        unsafe fn invoke(
-            s: &Self::State,
-            input: &mut DataChunkHandle,
-            output: &mut dyn WritableVector,
-        ) -> Result<(), Box<dyn std::error::Error>> {
-            assert_eq!(s.inner, 42);
-            let values = input.flat_vector(0);
-            let values = values.as_slice_with_len::<duckdb_string_t>(input.len());
-            let strings = values
-                .iter()
-                .map(|ptr| DuckString::new(&mut { *ptr }).as_str().to_string())
-                .take(input.len());
-            let output = output.flat_vector();
-            for s in strings {
-                output.insert(0, s.to_string().as_str());
-            }
-            Ok(())
-        }
+    //     fn signatures() -> Vec<AggregateFunctionSignature> {
+    //         vec![AggregateFunctionSignature::exact(
+    //             vec![LogicalTypeId::Varchar.into()],
+    //             LogicalTypeId::Varchar.into(),
+    //         )]
+    //     }
+    // }
 
-        fn signatures() -> Vec<AggregateFunctionSignature> {
-            vec![AggregateFunctionSignature::exact(
-                vec![LogicalTypeId::Varchar.into()],
-                LogicalTypeId::Varchar.into(),
-            )]
-        }
-    }
+    // struct Repeat {}
 
-    struct Repeat {}
+    // impl VAggregate for Repeat {
+    //     type State = ();
 
-    impl VAggregate for Repeat {
-        type State = ();
-
-        unsafe fn invoke(
-            _: &Self::State,
-            input: &mut DataChunkHandle,
-            output: &mut dyn WritableVector,
-        ) -> Result<(), Box<dyn std::error::Error>> {
-            let output = output.flat_vector();
-            let counts = input.flat_vector(1);
-            let values = input.flat_vector(0);
-            let values = values.as_slice_with_len::<duckdb_string_t>(input.len());
-            let strings = values
-                .iter()
-                .map(|ptr| DuckString::new(&mut { *ptr }).as_str().to_string());
-            let counts = counts.as_slice_with_len::<i32>(input.len());
-            for (count, value) in counts.iter().zip(strings).take(input.len()) {
-                output.insert(0, value.repeat((*count) as usize).as_str());
-            }
-
-            Ok(())
-        }
-
-        fn signatures() -> Vec<AggregateFunctionSignature> {
-            vec![AggregateFunctionSignature::exact(
-                vec![
-                    LogicalTypeHandle::from(LogicalTypeId::Varchar),
-                    LogicalTypeHandle::from(LogicalTypeId::Integer),
-                ],
-                LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            )]
-        }
-    }
+    //     fn signatures() -> Vec<AggregateFunctionSignature> {
+    //         vec![AggregateFunctionSignature::exact(
+    //             vec![
+    //                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
+    //                 LogicalTypeHandle::from(LogicalTypeId::Integer),
+    //             ],
+    //             LogicalTypeHandle::from(LogicalTypeId::Varchar),
+    //         )]
+    //     }
+    // }
 
     #[test]
     fn test_aggregate() -> Result<(), Box<dyn Error>> {
         let conn = Connection::open_in_memory()?;
-        conn.register_aggregate_function::<EchoAggregate>("echo")?;
+        conn.register_aggregate_function::<WeightedSumAggregater>("wsum")?;
 
-        let mut stmt = conn.prepare("select echo('hi') as hello")?;
+        let mut stmt = conn.prepare("select wsum(1) as hello")?;
         let mut rows = stmt.query([])?;
 
         while let Some(row) = rows.next()? {
@@ -277,39 +360,39 @@ mod test {
         Ok(())
     }
 
-    #[test]
-    fn test_aggregate_error() -> Result<(), Box<dyn Error>> {
-        let conn = Connection::open_in_memory()?;
-        conn.register_aggregate_function::<ErrorAggregate>("error_udf")?;
+    // #[test]
+    // fn test_aggregate_error() -> Result<(), Box<dyn Error>> {
+    //     let conn = Connection::open_in_memory()?;
+    //     conn.register_aggregate_function::<ErrorAggregate>("error_udf")?;
 
-        let mut stmt = conn.prepare("select error_udf('blurg') as hello")?;
-        if let Err(err) = stmt.query([]) {
-            assert!(err.to_string().contains("Error: blurg"));
-        } else {
-            panic!("Expected an error");
-        }
+    //     let mut stmt = conn.prepare("select error_udf('blurg') as hello")?;
+    //     if let Err(err) = stmt.query([]) {
+    //         assert!(err.to_string().contains("Error: blurg"));
+    //     } else {
+    //         panic!("Expected an error");
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
-    #[test]
-    fn test_repeat_aggregate() -> Result<(), Box<dyn Error>> {
-        let conn = Connection::open_in_memory()?;
-        conn.register_aggregate_function::<Repeat>("nobie_repeat")?;
+    // #[test]
+    // fn test_repeat_aggregate() -> Result<(), Box<dyn Error>> {
+    //     let conn = Connection::open_in_memory()?;
+    //     conn.register_aggregate_function::<Repeat>("nobie_repeat")?;
 
-        let batches = conn
-            .prepare("select nobie_repeat('Ho ho ho 🎅🎄', 3) as message from range(5)")?
-            .query_arrow([])?
-            .collect::<Vec<_>>();
+    //     let batches = conn
+    //         .prepare("select nobie_repeat('Ho ho ho 🎅🎄', 3) as message from range(5)")?
+    //         .query_arrow([])?
+    //         .collect::<Vec<_>>();
 
-        for batch in batches.iter() {
-            let array = batch.column(0);
-            let array = array.as_any().downcast_ref::<::arrow::array::StringArray>().unwrap();
-            for i in 0..array.len() {
-                assert_eq!(array.value(i), "Ho ho ho 🎅🎄Ho ho ho 🎅🎄Ho ho ho 🎅🎄");
-            }
-        }
+    //     for batch in batches.iter() {
+    //         let array = batch.column(0);
+    //         let array = array.as_any().downcast_ref::<::arrow::array::StringArray>().unwrap();
+    //         for i in 0..array.len() {
+    //             assert_eq!(array.value(i), "Ho ho ho 🎅🎄Ho ho ho 🎅🎄Ho ho ho 🎅🎄");
+    //         }
+    //     }
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 }
