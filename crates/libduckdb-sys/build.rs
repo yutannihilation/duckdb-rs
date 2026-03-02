@@ -686,6 +686,7 @@ mod bindings {
             .allowlist_item(r#"(\w*duckdb\w*)"#)
             .allowlist_type("idx_t")
             .layout_tests(false) // causes problems on WASM builds
+            .wrap_unsafe_ops(true) // for Rust 2024
             .clang_arg("-DDUCKDB_EXTENSION_API_VERSION_UNSTABLE")
             .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
             .generate()
