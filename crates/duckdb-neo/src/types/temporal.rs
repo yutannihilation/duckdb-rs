@@ -248,9 +248,9 @@ unsafe impl WritableNativeElement for IntervalValue {
 
 #[cfg(feature = "jiff")]
 mod external {
-    use ::jiff::{SignedDuration, Timestamp, civil};
+    use ::jiff::{SignedDuration, Span, Timestamp, civil};
 
-    use crate::types::{DateValue, TimestampMsValue, TimestampTzValue, TimestampValue};
+    use crate::types::{DateValue, IntervalValue, TimestampMsValue, TimestampTzValue, TimestampValue};
     use crate::types::{TimeNsValue, TimeValue, TimestampNsValue, TimestampSecValue, TimestampTzNsValue};
 
     const EPOCH_DATE: civil::Date = civil::date(1970, 1, 1);
@@ -377,6 +377,60 @@ mod external {
     }
 
     // jiff has no time-with-offset type.
+
+    // A span keeps months and days as calendar units and the rest as exact time, like an interval,
+    // so adding the converted span to a `civil::DateTime` matches DuckDB's `TIMESTAMP` arithmetic, and
+    // adding it to a `Zoned` in the session's `TimeZone` matches its `TIMESTAMPTZ` arithmetic.
+    /// Maps months, days, and micros to the span's months, days, and microseconds, without balancing.
+    ///
+    /// Returns `None` when the components have mixed signs (such as `1 month -1 day`), which a span
+    /// cannot represent, or when a component exceeds jiff's limit for its unit (about 20,000 years).
+    impl From<IntervalValue> for Option<Span> {
+        fn from(value: IntervalValue) -> Self {
+            let IntervalValue { months, days, micros } = value;
+            let signs = [i64::from(months).signum(), i64::from(days).signum(), micros.signum()];
+            if signs.contains(&1) && signs.contains(&-1) {
+                return None;
+            }
+            Span::new()
+                .try_months(months)
+                .ok()?
+                .try_days(days)
+                .ok()?
+                .try_microseconds(micros)
+                .ok()
+        }
+    }
+
+    /// Folds years into months, weeks into days, and every clock unit into micros.
+    ///
+    /// Fails when the nanoseconds are not a whole number of microseconds.
+    impl TryFrom<Span> for IntervalValue {
+        type Error = crate::Error;
+
+        fn try_from(value: Span) -> crate::Result<Self> {
+            let nanoseconds = value.get_nanoseconds();
+            if nanoseconds % 1_000 != 0 {
+                return Err(crate::Error::invalid_input(
+                    "interval precision cannot be represented exactly",
+                ));
+            }
+            let months = i128::from(value.get_years()) * 12 + i128::from(value.get_months());
+            let days = i128::from(value.get_weeks()) * 7 + i128::from(value.get_days());
+            let micros = i128::from(value.get_hours()) * 3_600_000_000
+                + i128::from(value.get_minutes()) * 60_000_000
+                + i128::from(value.get_seconds()) * 1_000_000
+                + i128::from(value.get_milliseconds()) * 1_000
+                + i128::from(value.get_microseconds())
+                + i128::from(nanoseconds / 1_000);
+            let out_of_range = |_| crate::Error::invalid_input("interval is out of range");
+            Ok(Self {
+                months: i32::try_from(months).map_err(out_of_range)?,
+                days: i32::try_from(days).map_err(out_of_range)?,
+                micros: i64::try_from(micros).map_err(out_of_range)?,
+            })
+        }
+    }
 
     // Timestamps without a time zone map to `civil::DateTime`; only the TZ variants map to `Timestamp`.
     /// Returns `None` for infinity or timestamps outside jiff's range.
