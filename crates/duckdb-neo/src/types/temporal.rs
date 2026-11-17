@@ -255,7 +255,11 @@ mod external {
 
     const EPOCH_DATE: civil::Date = civil::date(1970, 1, 1);
     const EPOCH_DATETIME: civil::DateTime = civil::datetime(1970, 1, 1, 0, 0, 0, 0);
-    const NANOS_PER_DAY: i64 = 86_400 * 1_000_000_000;
+
+    /// Whether a raw timestamp is one of DuckDB's `infinity` / `-infinity` sentinels.
+    const fn is_infinity(raw: i64) -> bool {
+        raw == i64::MAX || raw == -i64::MAX
+    }
 
     /// Returns `None` for infinity or dates outside jiff's range.
     impl From<DateValue> for Option<civil::Date> {
@@ -273,10 +277,8 @@ mod external {
         }
     }
 
+    // jiff rejects results before midnight or at/after 24:00.
     fn time_from_nanos(nanos: i64) -> Option<civil::Time> {
-        if !(0..NANOS_PER_DAY).contains(&nanos) {
-            return None;
-        }
         civil::Time::midnight()
             .checked_add(SignedDuration::from_nanos(nanos))
             .ok()
@@ -297,16 +299,20 @@ mod external {
     }
 
     fn checked_timestamp_units(duration: SignedDuration, units_per_second: i64) -> crate::Result<i64> {
-        let nanos_per_unit = i128::from(1_000_000_000 / units_per_second);
-        let nanos = duration.as_nanos();
-        if nanos % nanos_per_unit != 0 {
+        let nanos_per_unit = 1_000_000_000 / units_per_second;
+        // `subsec_nanos` has the same sign as `as_secs`, so both parts truncate toward zero together.
+        let subsec_nanos = i64::from(duration.subsec_nanos());
+        if subsec_nanos % nanos_per_unit != 0 {
             return Err(crate::Error::invalid_input(
                 "timestamp precision cannot be represented exactly",
             ));
         }
-        let units = i64::try_from(nanos / nanos_per_unit)
-            .map_err(|_| crate::Error::invalid_input("timestamp is out of range"))?;
-        if units == i64::MAX || units == -i64::MAX {
+        let units = duration
+            .as_secs()
+            .checked_mul(units_per_second)
+            .and_then(|units| units.checked_add(subsec_nanos / nanos_per_unit))
+            .ok_or_else(|| crate::Error::invalid_input("timestamp is out of range"))?;
+        if is_infinity(units) {
             return Err(crate::Error::invalid_input("timestamp is reserved for infinity"));
         }
         Ok(units)
@@ -462,7 +468,7 @@ mod external {
     }
 
     fn finite_timestamp_nanos(value: i64) -> Option<SignedDuration> {
-        if value == i64::MAX || value == -i64::MAX {
+        if is_infinity(value) {
             return None;
         }
         Some(SignedDuration::from_nanos(value))
