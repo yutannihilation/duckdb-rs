@@ -246,192 +246,192 @@ unsafe impl WritableNativeElement for IntervalValue {
     }
 }
 
-#[cfg(feature = "chrono")]
+#[cfg(feature = "jiff")]
 mod external {
-    use ::chrono::Timelike;
+    use ::jiff::{SignedDuration, Timestamp, civil};
 
     use crate::types::{DateValue, TimestampMsValue, TimestampTzValue, TimestampValue};
     use crate::types::{TimeNsValue, TimeValue, TimestampNsValue, TimestampSecValue, TimestampTzNsValue};
 
-    /// Returns `None` for infinity or dates outside chrono's range.
-    impl From<DateValue> for Option<::chrono::NaiveDate> {
+    const EPOCH_DATE: civil::Date = civil::date(1970, 1, 1);
+    const EPOCH_DATETIME: civil::DateTime = civil::datetime(1970, 1, 1, 0, 0, 0, 0);
+    const NANOS_PER_DAY: i64 = 86_400 * 1_000_000_000;
+
+    /// Returns `None` for infinity or dates outside jiff's range.
+    impl From<DateValue> for Option<civil::Date> {
         fn from(value: DateValue) -> Self {
-            ::chrono::NaiveDate::from_epoch_days(value.0)
+            EPOCH_DATE
+                .checked_add(SignedDuration::from_hours(i64::from(value.0) * 24))
+                .ok()
         }
     }
 
-    impl From<::chrono::NaiveDate> for DateValue {
-        fn from(value: ::chrono::NaiveDate) -> Self {
-            Self(value.to_epoch_days())
+    impl From<civil::Date> for DateValue {
+        fn from(value: civil::Date) -> Self {
+            // jiff dates span years -9999..=9999, so the day count always fits in `i32`.
+            Self((value.duration_since(EPOCH_DATE).as_secs() / 86_400) as i32)
         }
+    }
+
+    fn time_from_nanos(nanos: i64) -> Option<civil::Time> {
+        if !(0..NANOS_PER_DAY).contains(&nanos) {
+            return None;
+        }
+        civil::Time::midnight()
+            .checked_add(SignedDuration::from_nanos(nanos))
+            .ok()
     }
 
     /// Returns `None` for times outside midnight (inclusive) to 24:00 (exclusive).
-    impl From<TimeValue> for Option<::chrono::NaiveTime> {
+    impl From<TimeValue> for Option<civil::Time> {
         fn from(value: TimeValue) -> Self {
-            let seconds = u32::try_from(value.0 / 1_000_000).ok()?;
-            let nano = u32::try_from((value.0 % 1_000_000) * 1_000).ok()?;
-
-            ::chrono::NaiveTime::from_num_seconds_from_midnight_opt(seconds, nano)
+            time_from_nanos(value.0.checked_mul(1_000)?)
         }
     }
 
     /// Returns `None` for times outside midnight (inclusive) to 24:00 (exclusive).
-    impl From<TimeNsValue> for Option<::chrono::NaiveTime> {
+    impl From<TimeNsValue> for Option<civil::Time> {
         fn from(value: TimeNsValue) -> Self {
-            let seconds = u32::try_from(value.0 / 1_000_000_000).ok()?;
-            let nano = u32::try_from(value.0 % 1_000_000_000).ok()?;
-            ::chrono::NaiveTime::from_num_seconds_from_midnight_opt(seconds, nano)
+            time_from_nanos(value.0)
         }
     }
 
-    fn checked_timestamp_units(seconds: i64, nanos: u32, units_per_second: i64) -> crate::Result<i64> {
-        let nanos_per_unit = 1_000_000_000 / units_per_second;
-        if nanos >= 1_000_000_000 || i64::from(nanos) % nanos_per_unit != 0 {
+    fn checked_timestamp_units(duration: SignedDuration, units_per_second: i64) -> crate::Result<i64> {
+        let nanos_per_unit = i128::from(1_000_000_000 / units_per_second);
+        let nanos = duration.as_nanos();
+        if nanos % nanos_per_unit != 0 {
             return Err(crate::Error::invalid_input(
                 "timestamp precision cannot be represented exactly",
             ));
         }
-        let units = i128::from(seconds) * i128::from(units_per_second) + i128::from(nanos) / i128::from(nanos_per_unit);
-        let units = i64::try_from(units).map_err(|_| crate::Error::invalid_input("timestamp is out of range"))?;
+        let units = i64::try_from(nanos / nanos_per_unit)
+            .map_err(|_| crate::Error::invalid_input("timestamp is out of range"))?;
         if units == i64::MAX || units == -i64::MAX {
             return Err(crate::Error::invalid_input("timestamp is reserved for infinity"));
         }
         Ok(units)
     }
 
-    impl TryFrom<::chrono::NaiveTime> for TimeValue {
+    impl TryFrom<civil::Time> for TimeValue {
         type Error = crate::Error;
 
-        fn try_from(value: ::chrono::NaiveTime) -> crate::Result<Self> {
-            checked_timestamp_units(
-                i64::from(value.num_seconds_from_midnight()),
-                value.nanosecond(),
-                1_000_000,
-            )
-            .map(Self)
+        fn try_from(value: civil::Time) -> crate::Result<Self> {
+            checked_timestamp_units(value.duration_since(civil::Time::midnight()), 1_000_000).map(Self)
         }
     }
 
-    impl TryFrom<::chrono::NaiveTime> for TimeNsValue {
+    impl TryFrom<civil::Time> for TimeNsValue {
         type Error = crate::Error;
 
-        fn try_from(value: ::chrono::NaiveTime) -> crate::Result<Self> {
-            checked_timestamp_units(
-                i64::from(value.num_seconds_from_midnight()),
-                value.nanosecond(),
-                1_000_000_000,
-            )
-            .map(Self)
+        fn try_from(value: civil::Time) -> crate::Result<Self> {
+            checked_timestamp_units(value.duration_since(civil::Time::midnight()), 1_000_000_000).map(Self)
         }
     }
 
-    impl TryFrom<::chrono::NaiveDateTime> for TimestampValue {
+    impl TryFrom<civil::DateTime> for TimestampValue {
         type Error = crate::Error;
 
-        fn try_from(value: ::chrono::NaiveDateTime) -> crate::Result<Self> {
-            let value = value.and_utc();
-            checked_timestamp_units(value.timestamp(), value.nanosecond(), 1_000_000).map(Self)
+        fn try_from(value: civil::DateTime) -> crate::Result<Self> {
+            checked_timestamp_units(value.duration_since(EPOCH_DATETIME), 1_000_000).map(Self)
         }
     }
 
-    impl TryFrom<::chrono::NaiveDateTime> for TimestampSecValue {
+    impl TryFrom<civil::DateTime> for TimestampSecValue {
         type Error = crate::Error;
 
-        fn try_from(value: ::chrono::NaiveDateTime) -> crate::Result<Self> {
-            let value = value.and_utc();
-            checked_timestamp_units(value.timestamp(), value.nanosecond(), 1).map(Self)
+        fn try_from(value: civil::DateTime) -> crate::Result<Self> {
+            checked_timestamp_units(value.duration_since(EPOCH_DATETIME), 1).map(Self)
         }
     }
 
-    impl TryFrom<::chrono::NaiveDateTime> for TimestampMsValue {
+    impl TryFrom<civil::DateTime> for TimestampMsValue {
         type Error = crate::Error;
 
-        fn try_from(value: ::chrono::NaiveDateTime) -> crate::Result<Self> {
-            let value = value.and_utc();
-            checked_timestamp_units(value.timestamp(), value.nanosecond(), 1_000).map(Self)
+        fn try_from(value: civil::DateTime) -> crate::Result<Self> {
+            checked_timestamp_units(value.duration_since(EPOCH_DATETIME), 1_000).map(Self)
         }
     }
 
-    impl TryFrom<::chrono::NaiveDateTime> for TimestampNsValue {
+    impl TryFrom<civil::DateTime> for TimestampNsValue {
         type Error = crate::Error;
 
-        fn try_from(value: ::chrono::NaiveDateTime) -> crate::Result<Self> {
-            let value = value.and_utc();
-            checked_timestamp_units(value.timestamp(), value.nanosecond(), 1_000_000_000).map(Self)
+        fn try_from(value: civil::DateTime) -> crate::Result<Self> {
+            checked_timestamp_units(value.duration_since(EPOCH_DATETIME), 1_000_000_000).map(Self)
         }
     }
 
-    impl TryFrom<::chrono::DateTime<::chrono::Utc>> for TimestampTzValue {
+    impl TryFrom<Timestamp> for TimestampTzValue {
         type Error = crate::Error;
 
-        fn try_from(value: ::chrono::DateTime<::chrono::Utc>) -> crate::Result<Self> {
-            checked_timestamp_units(value.timestamp(), value.nanosecond(), 1_000_000).map(Self)
+        fn try_from(value: Timestamp) -> crate::Result<Self> {
+            checked_timestamp_units(value.as_duration(), 1_000_000).map(Self)
         }
     }
 
-    impl TryFrom<::chrono::DateTime<::chrono::Utc>> for TimestampTzNsValue {
+    impl TryFrom<Timestamp> for TimestampTzNsValue {
         type Error = crate::Error;
 
-        fn try_from(value: ::chrono::DateTime<::chrono::Utc>) -> crate::Result<Self> {
-            checked_timestamp_units(value.timestamp(), value.nanosecond(), 1_000_000_000).map(Self)
+        fn try_from(value: Timestamp) -> crate::Result<Self> {
+            checked_timestamp_units(value.as_duration(), 1_000_000_000).map(Self)
         }
     }
 
-    // chrono has no time-with-offset type.
+    // jiff has no time-with-offset type.
 
-    // Timestamps without a time zone map to `NaiveDateTime`; only the TZ variants map to `DateTime<Utc>`.
-    /// Returns `None` for infinity or timestamps outside chrono's range.
-    impl From<TimestampValue> for Option<::chrono::NaiveDateTime> {
+    // Timestamps without a time zone map to `civil::DateTime`; only the TZ variants map to `Timestamp`.
+    /// Returns `None` for infinity or timestamps outside jiff's range.
+    impl From<TimestampValue> for Option<civil::DateTime> {
         fn from(value: TimestampValue) -> Self {
-            ::chrono::DateTime::from_timestamp_micros(value.0).map(|dt| dt.naive_utc())
+            EPOCH_DATETIME.checked_add(SignedDuration::from_micros(value.0)).ok()
         }
     }
 
-    /// Returns `None` for infinity or timestamps outside chrono's range.
-    impl From<TimestampSecValue> for Option<::chrono::NaiveDateTime> {
+    /// Returns `None` for infinity or timestamps outside jiff's range.
+    impl From<TimestampSecValue> for Option<civil::DateTime> {
         fn from(value: TimestampSecValue) -> Self {
-            ::chrono::DateTime::from_timestamp(value.0, 0).map(|dt| dt.naive_utc())
+            EPOCH_DATETIME.checked_add(SignedDuration::from_secs(value.0)).ok()
         }
     }
 
-    /// Returns `None` for infinity or timestamps outside chrono's range.
-    impl From<TimestampMsValue> for Option<::chrono::NaiveDateTime> {
+    /// Returns `None` for infinity or timestamps outside jiff's range.
+    impl From<TimestampMsValue> for Option<civil::DateTime> {
         fn from(value: TimestampMsValue) -> Self {
-            ::chrono::DateTime::from_timestamp_millis(value.0).map(|dt| dt.naive_utc())
+            EPOCH_DATETIME.checked_add(SignedDuration::from_millis(value.0)).ok()
         }
     }
 
-    /// Returns `None` for infinity or timestamps outside chrono's range.
-    impl From<TimestampTzValue> for Option<::chrono::DateTime<::chrono::Utc>> {
+    /// Returns `None` for infinity or timestamps outside jiff's range.
+    impl From<TimestampTzValue> for Option<Timestamp> {
         fn from(value: TimestampTzValue) -> Self {
-            ::chrono::DateTime::from_timestamp_micros(value.0)
+            Timestamp::from_microsecond(value.0).ok()
         }
     }
 
-    fn timestamp_nanos_to_chrono(value: i64) -> Option<::chrono::DateTime<::chrono::Utc>> {
+    fn finite_timestamp_nanos(value: i64) -> Option<SignedDuration> {
         if value == i64::MAX || value == -i64::MAX {
             return None;
         }
-        Some(::chrono::DateTime::from_timestamp_nanos(value))
+        Some(SignedDuration::from_nanos(value))
     }
 
-    /// Returns `None` for infinity; every finite nanosecond timestamp fits chrono's range.
-    impl From<TimestampNsValue> for Option<::chrono::NaiveDateTime> {
+    /// Returns `None` for infinity; every finite nanosecond timestamp fits jiff's range.
+    impl From<TimestampNsValue> for Option<civil::DateTime> {
         fn from(value: TimestampNsValue) -> Self {
-            timestamp_nanos_to_chrono(value.0).map(|dt| dt.naive_utc())
+            EPOCH_DATETIME.checked_add(finite_timestamp_nanos(value.0)?).ok()
         }
     }
 
-    /// Returns `None` for infinity; every finite nanosecond timestamp fits chrono's range.
-    impl From<TimestampTzNsValue> for Option<::chrono::DateTime<::chrono::Utc>> {
+    /// Returns `None` for infinity; every finite nanosecond timestamp fits jiff's range.
+    impl From<TimestampTzNsValue> for Option<Timestamp> {
         fn from(value: TimestampTzNsValue) -> Self {
-            timestamp_nanos_to_chrono(value.0)
+            Timestamp::from_duration(finite_timestamp_nanos(value.0)?).ok()
         }
     }
 
     #[cfg(test)]
     mod tests {
+        use ::jiff::{Timestamp, civil, tz::Offset};
+
         use crate::{
             Parameters,
             environment::{Environment, StorageLocation},
@@ -441,95 +441,82 @@ mod external {
             },
         };
 
-        fn naive(s: &str) -> ::chrono::NaiveDateTime {
-            ::chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f").unwrap()
+        fn naive(s: &str) -> civil::DateTime {
+            s.parse().unwrap()
+        }
+
+        fn utc(value: civil::DateTime) -> Timestamp {
+            Offset::UTC.to_timestamp(value).unwrap()
         }
 
         #[test]
-        fn test_checked_chrono_to_storage() -> crate::Result<()> {
+        fn test_checked_jiff_to_storage() -> crate::Result<()> {
             for text in ["1992-09-20 11:30:00", "1960-01-02 03:04:05"] {
                 let value = naive(text);
                 assert_eq!(
-                    Option::<::chrono::NaiveDateTime>::from(TimestampValue::try_from(value)?),
+                    Option::<civil::DateTime>::from(TimestampValue::try_from(value)?),
                     Some(value)
                 );
                 assert_eq!(
-                    Option::<::chrono::NaiveDateTime>::from(TimestampSecValue::try_from(value)?),
+                    Option::<civil::DateTime>::from(TimestampSecValue::try_from(value)?),
                     Some(value)
                 );
                 assert_eq!(
-                    Option::<::chrono::NaiveDateTime>::from(TimestampMsValue::try_from(value)?),
+                    Option::<civil::DateTime>::from(TimestampMsValue::try_from(value)?),
                     Some(value)
                 );
                 assert_eq!(
-                    Option::<::chrono::NaiveDateTime>::from(TimestampNsValue::try_from(value)?),
+                    Option::<civil::DateTime>::from(TimestampNsValue::try_from(value)?),
                     Some(value)
                 );
-                let utc = value.and_utc();
-                assert_eq!(
-                    Option::<::chrono::DateTime<::chrono::Utc>>::from(TimestampTzValue::try_from(utc)?),
-                    Some(utc)
-                );
-                assert_eq!(
-                    Option::<::chrono::DateTime<::chrono::Utc>>::from(TimestampTzNsValue::try_from(utc)?),
-                    Some(utc)
-                );
+                let utc = utc(value);
+                assert_eq!(Option::<Timestamp>::from(TimestampTzValue::try_from(utc)?), Some(utc));
+                assert_eq!(Option::<Timestamp>::from(TimestampTzNsValue::try_from(utc)?), Some(utc));
             }
             let micros = naive("1960-01-02 03:04:05.123456");
             assert_eq!(
-                Option::<::chrono::NaiveDateTime>::from(TimestampValue::try_from(micros)?),
+                Option::<civil::DateTime>::from(TimestampValue::try_from(micros)?),
                 Some(micros)
             );
             let millis = naive("1960-01-02 03:04:05.123");
             assert_eq!(
-                Option::<::chrono::NaiveDateTime>::from(TimestampMsValue::try_from(millis)?),
+                Option::<civil::DateTime>::from(TimestampMsValue::try_from(millis)?),
                 Some(millis)
             );
             let nanos = naive("1960-01-02 03:04:05.123456789");
             assert_eq!(
-                Option::<::chrono::NaiveDateTime>::from(TimestampNsValue::try_from(nanos)?),
+                Option::<civil::DateTime>::from(TimestampNsValue::try_from(nanos)?),
                 Some(nanos)
             );
             assert_eq!(
-                Option::<::chrono::NaiveTime>::from(TimeValue::try_from(micros.time())?),
+                Option::<civil::Time>::from(TimeValue::try_from(micros.time())?),
                 Some(micros.time())
             );
             assert_eq!(
-                Option::<::chrono::NaiveTime>::from(TimeNsValue::try_from(nanos.time())?),
+                Option::<civil::Time>::from(TimeNsValue::try_from(nanos.time())?),
                 Some(nanos.time())
             );
             Ok(())
         }
 
         #[test]
-        fn test_checked_chrono_to_storage_rejects_loss_and_overflow() {
+        fn test_checked_jiff_to_storage_rejects_loss_and_overflow() {
             let nanos = naive("1992-09-20 11:30:00.123456789");
             assert!(TimestampSecValue::try_from(nanos).is_err());
             assert!(TimestampMsValue::try_from(nanos).is_err());
             assert!(TimestampValue::try_from(nanos).is_err());
-            assert!(TimestampTzValue::try_from(nanos.and_utc()).is_err());
+            assert!(TimestampTzValue::try_from(utc(nanos)).is_err());
             assert!(TimeValue::try_from(nanos.time()).is_err());
 
-            let leap = ::chrono::NaiveDate::from_ymd_opt(2016, 12, 31)
-                .unwrap()
-                .and_hms_nano_opt(23, 59, 59, 1_000_000_000)
-                .unwrap();
-            assert!(TimeValue::try_from(leap.time()).is_err());
-            assert!(TimeNsValue::try_from(leap.time()).is_err());
-            assert!(TimestampValue::try_from(leap).is_err());
-            assert!(TimestampSecValue::try_from(leap).is_err());
-            assert!(TimestampMsValue::try_from(leap).is_err());
-            assert!(TimestampNsValue::try_from(leap).is_err());
-            assert!(TimestampTzValue::try_from(leap.and_utc()).is_err());
-            assert!(TimestampTzNsValue::try_from(leap.and_utc()).is_err());
-
-            for value in [::chrono::NaiveDateTime::MIN, ::chrono::NaiveDateTime::MAX] {
+            for value in [civil::DateTime::MIN, civil::DateTime::MAX] {
                 assert!(TimestampNsValue::try_from(value).is_err());
-                assert!(TimestampTzNsValue::try_from(value.and_utc()).is_err());
+            }
+            for value in [Timestamp::MIN, Timestamp::MAX] {
+                assert!(TimestampTzNsValue::try_from(value).is_err());
             }
             for raw in [i64::MAX, -i64::MAX] {
-                let value = ::chrono::DateTime::from_timestamp_nanos(raw);
-                assert!(TimestampNsValue::try_from(value.naive_utc()).is_err());
+                let value = Timestamp::from_nanosecond(i128::from(raw)).unwrap();
+                assert!(TimestampNsValue::try_from(Offset::UTC.to_datetime(value)).is_err());
                 assert!(TimestampTzNsValue::try_from(value).is_err());
             }
         }
@@ -537,10 +524,10 @@ mod external {
         #[test]
         fn test_date_epoch_round_trip() {
             for (year, month, day, days) in [(1969, 12, 31, -1), (1970, 1, 1, 0), (1992, 9, 20, 8298)] {
-                let date = ::chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap();
+                let date = civil::date(year, month, day);
                 let raw = DateValue::from(date);
                 assert_eq!(raw.0, days);
-                assert_eq!(Option::<::chrono::NaiveDate>::from(raw), Some(date));
+                assert_eq!(Option::<civil::Date>::from(raw), Some(date));
             }
         }
 
@@ -556,9 +543,9 @@ mod external {
             let vec = chunk.get_vector_at::<DateValue>(0)?;
 
             assert_eq!(vec.len(), 1);
-            let chrono = Option::<::chrono::NaiveDate>::from(*vec.reader()?.get(0)?.unwrap()).unwrap();
+            let date = Option::<civil::Date>::from(*vec.reader()?.get(0)?.unwrap()).unwrap();
 
-            assert_eq!(chrono, ::chrono::NaiveDate::from_ymd_opt(1992, 9, 20).unwrap());
+            assert_eq!(date, civil::date(1992, 9, 20));
 
             Ok(())
         }
@@ -573,7 +560,7 @@ mod external {
                     conn.query("SELECT TIMESTAMP_NS '1992-09-20 11:30:00.123456789';", Parameters::None)?;
                 let chunk = result.next_chunk()?.unwrap();
                 let vec = chunk.get_vector_at::<TimestampNsValue>(0)?;
-                let timestamp = Option::<::chrono::NaiveDateTime>::from(*vec.reader()?.get(0)?.unwrap()).unwrap();
+                let timestamp = Option::<civil::DateTime>::from(*vec.reader()?.get(0)?.unwrap()).unwrap();
                 assert_eq!(timestamp, naive("1992-09-20 11:30:00.123456789"));
             }
             {
@@ -581,7 +568,7 @@ mod external {
                 let chunk = result.next_chunk()?.unwrap();
                 let vec = chunk.get_vector_at::<TimestampValue>(0)?;
                 let val = *(vec.reader()?.get(0)?.unwrap());
-                let timestamp = Option::<::chrono::NaiveDateTime>::from(val).unwrap();
+                let timestamp = Option::<civil::DateTime>::from(val).unwrap();
                 assert_eq!(timestamp, naive("1992-09-20 11:30:00.123456"));
             }
             {
@@ -590,7 +577,7 @@ mod external {
                 let chunk = result.next_chunk()?.unwrap();
                 let vec = chunk.get_vector_at::<TimestampMsValue>(0)?;
                 let val = *(vec.reader()?.get(0)?.unwrap());
-                let timestamp = Option::<::chrono::NaiveDateTime>::from(val).unwrap();
+                let timestamp = Option::<civil::DateTime>::from(val).unwrap();
                 assert_eq!(timestamp, naive("1992-09-20 11:30:00.123"));
             }
             {
@@ -598,7 +585,7 @@ mod external {
                 let chunk = result.next_chunk()?.unwrap();
                 let vec = chunk.get_vector_at::<TimestampSecValue>(0)?;
                 let val = *(vec.reader()?.get(0)?.unwrap());
-                let timestamp = Option::<::chrono::NaiveDateTime>::from(val).unwrap();
+                let timestamp = Option::<civil::DateTime>::from(val).unwrap();
                 assert_eq!(timestamp, naive("1992-09-20 11:30:00"));
             }
             {
@@ -609,13 +596,8 @@ mod external {
                 let chunk = result.next_chunk()?.unwrap();
                 let vec = chunk.get_vector_at::<TimestampTzValue>(0)?;
                 let val = *(vec.reader()?.get(0)?.unwrap());
-                let timestamp = Option::<::chrono::DateTime<::chrono::Utc>>::from(val).unwrap();
-                assert_eq!(
-                    timestamp,
-                    ::chrono::DateTime::parse_from_rfc3339("1992-09-20T11:30:00.123456Z")
-                        .unwrap()
-                        .with_timezone(&::chrono::Utc)
-                );
+                let timestamp = Option::<Timestamp>::from(val).unwrap();
+                assert_eq!(timestamp, "1992-09-20T11:30:00.123456Z".parse::<Timestamp>().unwrap());
             }
             {
                 let mut result = conn.query(
@@ -625,12 +607,10 @@ mod external {
                 let chunk = result.next_chunk()?.unwrap();
                 let vec = chunk.get_vector_at::<TimestampTzValue>(0)?;
                 let val = *(vec.reader()?.get(0)?.unwrap());
-                let timestamp = Option::<::chrono::DateTime<::chrono::Utc>>::from(val).unwrap();
+                let timestamp = Option::<Timestamp>::from(val).unwrap();
                 assert_eq!(
                     timestamp,
-                    ::chrono::DateTime::parse_from_rfc3339("1992-09-20T12:30:00.123456+01:00")
-                        .unwrap()
-                        .with_timezone(&::chrono::Utc)
+                    "1992-09-20T12:30:00.123456+01:00".parse::<Timestamp>().unwrap()
                 );
             }
             {
@@ -640,9 +620,8 @@ mod external {
                 )?;
                 let chunk = result.next_chunk()?.unwrap();
                 let vector = chunk.get_vector_at::<TimestampTzNsValue>(0)?;
-                let timestamp =
-                    Option::<::chrono::DateTime<::chrono::Utc>>::from(*vector.reader()?.get(0)?.unwrap()).unwrap();
-                assert_eq!(timestamp, naive("1992-09-20 11:30:00.123456789").and_utc());
+                let timestamp = Option::<Timestamp>::from(*vector.reader()?.get(0)?.unwrap()).unwrap();
+                assert_eq!(timestamp, utc(naive("1992-09-20 11:30:00.123456789")));
             }
             Ok(())
         }
@@ -674,35 +653,31 @@ mod external {
 
             for index in 0..2 {
                 let vector = chunk.get_vector_at::<TimestampNsValue>(index)?;
-                assert!(Option::<::chrono::NaiveDateTime>::from(*vector.reader()?.get(0)?.unwrap()).is_none());
+                assert!(Option::<civil::DateTime>::from(*vector.reader()?.get(0)?.unwrap()).is_none());
             }
             for index in 2..4 {
                 let vector = chunk.get_vector_at::<TimestampTzNsValue>(index)?;
-                assert!(
-                    Option::<::chrono::DateTime<::chrono::Utc>>::from(*vector.reader()?.get(0)?.unwrap()).is_none()
-                );
+                assert!(Option::<Timestamp>::from(*vector.reader()?.get(0)?.unwrap()).is_none());
             }
             for index in 4..6 {
                 let vector = chunk.get_vector_at::<DateValue>(index)?;
-                assert!(Option::<::chrono::NaiveDate>::from(*vector.reader()?.get(0)?.unwrap()).is_none());
+                assert!(Option::<civil::Date>::from(*vector.reader()?.get(0)?.unwrap()).is_none());
             }
             for index in 6..8 {
                 let vector = chunk.get_vector_at::<TimestampValue>(index)?;
-                assert!(Option::<::chrono::NaiveDateTime>::from(*vector.reader()?.get(0)?.unwrap()).is_none());
+                assert!(Option::<civil::DateTime>::from(*vector.reader()?.get(0)?.unwrap()).is_none());
             }
             for index in 8..10 {
                 let vector = chunk.get_vector_at::<TimestampSecValue>(index)?;
-                assert!(Option::<::chrono::NaiveDateTime>::from(*vector.reader()?.get(0)?.unwrap()).is_none());
+                assert!(Option::<civil::DateTime>::from(*vector.reader()?.get(0)?.unwrap()).is_none());
             }
             for index in 10..12 {
                 let vector = chunk.get_vector_at::<TimestampMsValue>(index)?;
-                assert!(Option::<::chrono::NaiveDateTime>::from(*vector.reader()?.get(0)?.unwrap()).is_none());
+                assert!(Option::<civil::DateTime>::from(*vector.reader()?.get(0)?.unwrap()).is_none());
             }
             for index in 12..14 {
                 let vector = chunk.get_vector_at::<TimestampTzValue>(index)?;
-                assert!(
-                    Option::<::chrono::DateTime<::chrono::Utc>>::from(*vector.reader()?.get(0)?.unwrap()).is_none()
-                );
+                assert!(Option::<Timestamp>::from(*vector.reader()?.get(0)?.unwrap()).is_none());
             }
 
             Ok(())
@@ -712,10 +687,10 @@ mod external {
         fn test_time_out_of_range_conversion() {
             let wrapping_micros = ((1_i64 << 32) + 5) * 1_000_000;
             for raw in [-1, i64::MIN, i64::MAX, wrapping_micros, 86_400_000_000] {
-                assert!(Option::<::chrono::NaiveTime>::from(TimeValue(raw)).is_none());
+                assert!(Option::<civil::Time>::from(TimeValue(raw)).is_none());
             }
             for raw in [-1, i64::MIN, i64::MAX, wrapping_micros * 1_000, 86_400_000_000_000] {
-                assert!(Option::<::chrono::NaiveTime>::from(TimeNsValue(raw)).is_none());
+                assert!(Option::<civil::Time>::from(TimeNsValue(raw)).is_none());
             }
         }
 
@@ -730,22 +705,16 @@ mod external {
                 let chunk = result.next_chunk()?.unwrap();
                 let vec = chunk.get_vector_at::<TimeValue>(0)?;
                 let val = *(vec.reader()?.get(0)?.unwrap());
-                let time = Option::<::chrono::NaiveTime>::from(val).unwrap();
-                assert_eq!(
-                    time,
-                    ::chrono::NaiveTime::parse_from_str("11:30:00.123456", "%H:%M:%S%.f").unwrap()
-                );
+                let time = Option::<civil::Time>::from(val).unwrap();
+                assert_eq!(time, "11:30:00.123456".parse::<civil::Time>().unwrap());
             }
             {
                 let mut result = conn.query("SELECT '15:30:00.123456789'::TIME_NS;", Parameters::None)?;
                 let chunk = result.next_chunk()?.unwrap();
                 let vec = chunk.get_vector_at::<TimeNsValue>(0)?;
                 let val = *(vec.reader()?.get(0)?.unwrap());
-                let time = Option::<::chrono::NaiveTime>::from(val).unwrap();
-                assert_eq!(
-                    time,
-                    ::chrono::NaiveTime::parse_from_str("15:30:00.123456789", "%H:%M:%S%.f").unwrap()
-                );
+                let time = Option::<civil::Time>::from(val).unwrap();
+                assert_eq!(time, "15:30:00.123456789".parse::<civil::Time>().unwrap());
             }
 
             Ok(())
